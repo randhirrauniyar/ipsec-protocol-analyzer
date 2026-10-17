@@ -1,0 +1,33 @@
+services:
+  gateway1:
+    build: .
+    image: ipsec-node:local
+    container_name: ipsec-gw1
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./gateway1/swanctl.conf:/etc/swanctl/swanctl.conf:ro
+      - ./captures:/captures
+    networks:
+      ipsec-net:
+        ipv4_address: 192.168.100.10
+
+  gateway2:
+    build: .
+    image: ipsec-node:local
+    container_name: ipsec-gw2
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./gateway2/swanctl.conf:/etc/swanctl/swanctl.conf:ro
+      - ./captures:/captures
+    networks:
+      ipsec-net:
+        ipv4_address: 192.168.100.20
+
+networks:
+  ipsec-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.100.0/24
