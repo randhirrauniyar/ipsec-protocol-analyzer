@@ -192,10 +192,23 @@ def main():
         try:
             captured = sniff(filter="udp port 500 or udp port 4500 or proto 50", count=args.count, timeout=args.timeout)
             process_packets(captured, source_label=f"Live Sniff Interface ({len(captured)} frames received)")
+        except (RuntimeError, OSError) as e:
+            if "libpcap" in str(e).lower() or platform.system() == "Windows":
+                print("\n[!] LIVE CAPTURE REQUIREMENT (Windows):")
+                print("    Live adapter sniffing requires the Npcap packet capture driver.")
+                print("    1. Download free installer: https://npcap.com/#download")
+                print("    2. Check 'Install Npcap in WinPcap API-compatible Mode' during setup.")
+                print("\n    Note: You can still analyze static PCAP files and run host audits without Npcap:")
+                print("    -> python src/ipsec_scanner.py captures/scenario_A1_s1.pcap")
+                print("    -> python src/ipsec_scanner.py --audit-host")
+            else:
+                print(f"[-] Live capture failed: {e}")
+        except PermissionError:
+            print("[!] Permission Denied: Live sniffing requires administrator / root privileges.")
+            if platform.system() == "Linux":
+                print("    Run with: sudo ./venv/bin/python src/ipsec_scanner.py --live")
         except Exception as e:
             print(f"[-] Live sniffing encountered an issue: {e}")
-            if platform.system() == "Windows":
-                print("[!] Note: Real-time network interface sniffing on Windows requires Npcap.")
     elif args.pcap_file:
         try:
             packets = rdpcap(args.pcap_file)
