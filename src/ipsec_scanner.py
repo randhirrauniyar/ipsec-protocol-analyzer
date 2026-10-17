@@ -3,16 +3,56 @@ import os
 import argparse
 import subprocess
 import platform
+import shutil
 import numpy as np
 import joblib
 import logging
 
-# Suppress Scapy runtime warnings
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import rdpcap, sniff, IP, UDP, ESP, raw
 
+def check_ipv6_leak_risk(current_os, sa_output_text):
+    """
+    Checks if active IPsec SAs protect only IPv4 while the host has
+    an active default IPv6 route, creating an unencrypted bypass vulnerability.
+    """
+    has_ipv6_default_route = False
+
+    try:
+        if current_os == "Windows":
+            cmd = [
+                "powershell", "-Command",
+                "Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue | Select-Object -Property NextHop, InterfaceAlias"
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if res.stdout.strip() and "NextHop" in res.stdout:
+                has_ipv6_default_route = True
+
+        elif current_os == "Linux":
+            res = subprocess.run(["ip", "-6", "route", "show", "default"], capture_output=True, text=True, timeout=5)
+            if res.stdout.strip():
+                has_ipv6_default_route = True
+    except Exception:
+        pass
+
+    has_active_sa = bool(sa_output_text and sa_output_text.strip())
+    has_ipv6_sa = ":" in sa_output_text if has_active_sa else False
+
+    print("\n[*] DUAL-STACK LEAK ASSESSMENT (IPv4 vs. IPv6):")
+    if has_active_sa and not has_ipv6_sa and has_ipv6_default_route:
+        print("    [ALERT: HIGH SEVERITY] Potential IPv6 Bypass / Leak Risk Detected!")
+        print("    - Details    : Active IPsec SAs cover IPv4 only, but host has an active default IPv6 route.")
+        print("    - Impact     : Dual-stack web requests (AAAA records) may bypass the IPsec tunnel and traverse unencrypted.")
+        print("    - Remediation: Enable IPv6 tunnel selectors in VPN gateway, or disable IPv6 on the host adapter.")
+    elif has_active_sa and has_ipv6_sa:
+        print("    [SECURITY PASS] Dual-stack coverage confirmed. IPv6 endpoints protected under IPsec SAs.")
+    elif not has_ipv6_default_route:
+        print("    [NOTICE] No active default IPv6 route detected on host. IPv6 leak risk is minimal.")
+    else:
+        print("    [NOTICE] Host network idle or unencapsulated.")
+
 def audit_host_system():
-    """Inspects the local machine's operational IPsec and VPN configuration."""
+    """Inspects host OS and container IPsec/VPN configurations."""
     current_os = platform.system()
     hostname = platform.node()
     
@@ -20,45 +60,34 @@ def audit_host_system():
     print(f"[*] LOCAL HOST IPSEC & NETWORK AUDIT: {hostname} ({current_os})")
     print("=" * 70)
 
+    sa_telemetry = ""
+
     if current_os == "Windows":
         print("[+] Querying Windows Advanced Security & NetTCPIP IPsec Engine...")
         try:
-            cmd_rules = [
-                "powershell", "-Command",
-                "Get-NetIPsecRule | Select-Object -First 10 -Property Name, DisplayName, Enabled, Profile | Format-Table -AutoSize"
-            ]
+            cmd_rules = ["powershell", "-Command", "Get-NetIPsecRule | Select-Object -First 10 -Property Name, DisplayName, Enabled, Profile | Format-Table -AutoSize"]
             res_rules = subprocess.run(cmd_rules, capture_output=True, text=True, timeout=8)
-            
-            cmd_mm_sa = [
-                "powershell", "-Command",
-                "Get-NetIPsecMainModeSA | Select-Object -Property LocalEndpoint, RemoteEndpoint, CipherAlgorithm, HashAlgorithm, KeyExchange | Format-Table -AutoSize"
-            ]
+            cmd_mm_sa = ["powershell", "-Command", "Get-NetIPsecMainModeSA | Select-Object -Property LocalEndpoint, RemoteEndpoint, CipherAlgorithm, HashAlgorithm, KeyExchange | Format-Table -AutoSize"]
             res_mm_sa = subprocess.run(cmd_mm_sa, capture_output=True, text=True, timeout=8)
-
-            cmd_qm_sa = [
-                "powershell", "-Command",
-                "Get-NetIPsecQuickModeSA | Select-Object -Property LocalEndpoint, RemoteEndpoint, EncryptionTransform, AuthenticationTransform | Format-Table -AutoSize"
-            ]
+            cmd_qm_sa = ["powershell", "-Command", "Get-NetIPsecQuickModeSA | Select-Object -Property LocalEndpoint, RemoteEndpoint, EncryptionTransform, AuthenticationTransform | Format-Table -AutoSize"]
             res_qm_sa = subprocess.run(cmd_qm_sa, capture_output=True, text=True, timeout=8)
 
             if res_rules.stdout.strip():
-                print("\n[+] Configured Host IPsec Rules:")
-                print(res_rules.stdout.strip())
+                print("\n[+] Configured Host IPsec Rules:\n", res_rules.stdout.strip())
             else:
                 print("[-] No explicit IPsec rules configured on this host.")
 
             if res_mm_sa.stdout.strip():
-                print("\n[!] ACTIVE IPSEC MAIN-MODE SAs (IKE Control Plane):")
-                print(res_mm_sa.stdout.strip())
+                print("\n[!] ACTIVE IPSEC MAIN-MODE SAs:\n", res_mm_sa.stdout.strip())
+                sa_telemetry += res_mm_sa.stdout
             else:
                 print("\n[-] Active Main-Mode SAs: None currently established.")
 
             if res_qm_sa.stdout.strip():
-                print("\n[!] ACTIVE IPSEC QUICK-MODE SAs (ESP Data Plane):")
-                print(res_qm_sa.stdout.strip())
+                print("\n[!] ACTIVE IPSEC QUICK-MODE SAs:\n", res_qm_sa.stdout.strip())
+                sa_telemetry += res_qm_sa.stdout
             else:
-                print("[-] Active Quick-Mode SAs: None currently established (idle/no active tunnel).")
-
+                print("[-] Active Quick-Mode SAs: None currently established.")
         except Exception as e:
             print(f"[-] Error querying Windows IPsec subsystem: {e}")
 
@@ -67,23 +96,40 @@ def audit_host_system():
         try:
             res_state = subprocess.run(["ip", "xfrm", "state"], capture_output=True, text=True, timeout=5)
             res_policy = subprocess.run(["ip", "xfrm", "policy"], capture_output=True, text=True, timeout=5)
-            
+
             if res_state.stdout.strip():
-                print("\n[!] ACTIVE KERNEL IPSEC SAs (ip xfrm state):")
+                print("\n[!] ACTIVE KERNEL IPSEC SAs (Host Network Namespace):")
                 print(res_state.stdout.strip())
+                sa_telemetry += res_state.stdout
             else:
-                print("[-] No active kernel XFRM states found.")
+                print("[-] No active kernel XFRM states in host root namespace.")
+                docker_check = subprocess.run(["docker", "ps", "--filter", "name=ipsec", "--format", "{{.Names}}"], capture_output=True, text=True)
+                containers = [c.strip() for c in docker_check.stdout.splitlines() if c.strip()]
+                if containers:
+                    print(f"[+] Detected {len(containers)} active IPsec container(s): {', '.join(containers)}")
+                    for c_name in containers:
+                        c_state = subprocess.run(["docker", "exec", c_name, "ip", "xfrm", "state"], capture_output=True, text=True)
+                        if c_state.stdout.strip():
+                            print(f"\n[!] ACTIVE KERNEL IPSEC SAs (Container: {c_name}):")
+                            print(c_state.stdout.strip())
+                            sa_telemetry += c_state.stdout
 
             if res_policy.stdout.strip():
                 print("\n[+] KERNEL SECURITY POLICIES (ip xfrm policy):")
                 print(res_policy.stdout.strip())
             else:
-                print("[-] No active kernel XFRM policies found.")
+                print("[-] No active kernel XFRM policies in host root namespace.")
+
+            if shutil.which("swanctl"):
+                res_swan = subprocess.run(["swanctl", "--list-sas"], capture_output=True, text=True, timeout=5)
+                if res_swan.returncode == 0 and res_swan.stdout.strip():
+                    print("\n[!] ACTIVE STRONGSWAN DAEMON SAs (swanctl):")
+                    print(res_swan.stdout.strip())
+                    sa_telemetry += res_swan.stdout
         except Exception as e:
             print(f"[-] Error querying Linux XFRM subsystem: {e}")
-    else:
-        print(f"[-] Operating system {current_os} is not directly supported for kernel SA queries.")
 
+    check_ipv6_leak_risk(current_os, sa_telemetry)
     print("=" * 70)
 
 def calculate_shannon_entropy(byte_sequence):
@@ -103,7 +149,14 @@ def process_packets(packets, source_label):
 
     for pkt in packets:
         if UDP in pkt and (pkt[UDP].sport in [500, 4500] or pkt[UDP].dport in [500, 4500]):
-            ike_packets.append(pkt)
+            payload = bytes(pkt[UDP].payload)
+            if (pkt[UDP].sport == 4500 or pkt[UDP].dport == 4500) and len(payload) >= 4:
+                if payload[:4] == b'\x00\x00\x00\x00':
+                    ike_packets.append(pkt)
+                else:
+                    esp_packets.append(pkt)
+            else:
+                ike_packets.append(pkt)
         elif ESP in pkt or (IP in pkt and pkt[IP].proto == 50):
             esp_packets.append(pkt)
 
@@ -111,7 +164,6 @@ def process_packets(packets, source_label):
     print(f"    - Data-Plane (ESP)      : {len(esp_packets)}")
     print("-" * 70)
 
-    # 1. Control-Plane Audit
     print("[*] CONTROL-PLANE COMPLIANCE AUDIT (NIST SP 800-77 Rev. 1)")
     if len(ike_packets) > 0:
         print(f"    [PASS] Detected {len(ike_packets)} IKE negotiation frames.")
@@ -125,11 +177,9 @@ def process_packets(packets, source_label):
         print("    [NOTICE] No active IKE handshakes captured in this window.")
     print("-" * 70)
 
-    # 2. Data-Plane Zero-Decryption ML Inference
     print("[*] DATA-PLANE ZERO-DECRYPTION ML INFERENCE")
     if len(esp_packets) < 5:
         print(f"    [!] Insufficient ESP traffic ({len(esp_packets)} frames) to construct a feature window.")
-        print("    [!] Connect to an active IPsec VPN tunnel to observe live inference.")
         print("=" * 70)
         return
 
@@ -147,11 +197,8 @@ def process_packets(packets, source_label):
     min_entropy = float(np.min(entropies))
     std_entropy = float(np.std(entropies))
 
-    mean_iat = 0.005
-    std_iat = 0.002
-
     features = np.array([[q10_len, q50_len, q90_len, mean_len, max_len, std_len,
-                          mean_iat, std_iat, mean_entropy, min_entropy, std_entropy]])
+                          0.005, 0.002, mean_entropy, min_entropy, std_entropy]])
 
     print(f"    - Mean Packet Length   : {mean_len:.2f} bytes")
     print(f"    - Mean Shannon Entropy : {mean_entropy:.4f} bits/byte (Min: {min_entropy:.4f})")
@@ -177,36 +224,25 @@ def main():
     parser.add_argument("pcap_file", nargs="?", help="Path to offline PCAP file to analyze")
     parser.add_argument("--audit-host", action="store_true", help="Inspect local OS IPsec configurations and active SAs")
     parser.add_argument("--live", action="store_true", help="Sniff live network interface for IPsec (IKE/ESP) frames")
-    parser.add_argument("--count", type=int, default=30, help="Number of packets to capture in live mode (default: 30)")
-    parser.add_argument("--timeout", type=int, default=15, help="Sniffing timeout in seconds (default: 15)")
+    parser.add_argument("--iface", type=str, default=None, help="Interface name to sniff")
+    parser.add_argument("--count", type=int, default=30, help="Number of packets to capture")
+    parser.add_argument("--timeout", type=int, default=15, help="Sniffing timeout in seconds")
 
     args = parser.parse_args()
 
     if args.audit_host:
         audit_host_system()
     elif args.live:
+        target_iface = args.iface
         print("=" * 70)
-        print(f"[*] LISTENING FOR LIVE IPSEC TRAFFIC (Timeout: {args.timeout}s, Count: {args.count} pkts)...")
-        print("[*] Filter: UDP Port 500, UDP Port 4500, or IP Protocol 50 (ESP)")
+        print(f"[*] LISTENING FOR LIVE IPSEC TRAFFIC ON: {target_iface or 'Default Interface'}")
+        print(f"[*] Filter: UDP 500, UDP 4500, or ESP (Proto 50) | Timeout: {args.timeout}s")
         print("=" * 70)
         try:
-            captured = sniff(filter="udp port 500 or udp port 4500 or proto 50", count=args.count, timeout=args.timeout)
-            process_packets(captured, source_label=f"Live Sniff Interface ({len(captured)} frames received)")
-        except (RuntimeError, OSError) as e:
-            if "libpcap" in str(e).lower() or platform.system() == "Windows":
-                print("\n[!] LIVE CAPTURE REQUIREMENT (Windows):")
-                print("    Live adapter sniffing requires the Npcap packet capture driver.")
-                print("    1. Download free installer: https://npcap.com/#download")
-                print("    2. Check 'Install Npcap in WinPcap API-compatible Mode' during setup.")
-                print("\n    Note: You can still analyze static PCAP files and run host audits without Npcap:")
-                print("    -> python src/ipsec_scanner.py captures/scenario_A1_s1.pcap")
-                print("    -> python src/ipsec_scanner.py --audit-host")
-            else:
-                print(f"[-] Live capture failed: {e}")
+            captured = sniff(iface=target_iface, filter="udp port 500 or udp port 4500 or proto 50", count=args.count, timeout=args.timeout)
+            process_packets(captured, source_label=f"Live Interface ({target_iface or 'default'})")
         except PermissionError:
             print("[!] Permission Denied: Live sniffing requires administrator / root privileges.")
-            if platform.system() == "Linux":
-                print("    Run with: sudo ./venv/bin/python src/ipsec_scanner.py --live")
         except Exception as e:
             print(f"[-] Live sniffing encountered an issue: {e}")
     elif args.pcap_file:
